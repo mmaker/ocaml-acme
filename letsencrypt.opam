@@ -16,7 +16,6 @@ depends: [
   "base64" {>= "3.1.0"}
   "cmdliner"
   "cohttp"
-  "cohttp-lwt" {>= "2.5.1"}
   "cohttp-lwt-unix" {>= "1.0.0"}
   "zarith"
   "logs"
