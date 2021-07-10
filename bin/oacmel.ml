@@ -1,6 +1,18 @@
 open Lwt.Infix
 
-module Acme_cli = Letsencrypt.Client.Make(Cohttp_lwt_unix.Client)
+module HTTP_client = struct
+  module Headers = Cohttp.Header
+  module Body = Cohttp_lwt.Body
+
+  module Response = struct
+    include Cohttp.Response
+    let status resp = Cohttp.Code.code_of_status (Cohttp.Response.status resp)
+  end
+
+  include Cohttp_lwt_unix.Client
+end
+
+module Acme_cli = Letsencrypt.Client.Make(HTTP_client)
 
 let dns_out ip cs =
   let out = Lwt_unix.(socket PF_INET SOCK_DGRAM 0) in

@@ -74,7 +74,7 @@ module Client: sig
       before continuing with ACME. *)
   val print_alpn : solver
 
-  module Make (Http : Cohttp_lwt.S.Client) : sig
+  module Make (Http : HTTP_client.S) : sig
 
     (** [initialise ~ctx ~endpoint ~email priv] constructs a [t] by
         looking up the directory and account of [priv] at [endpoint]. If no

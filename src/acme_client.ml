@@ -7,13 +7,6 @@ module Log = (val Logs.src_log src : Logs.LOG)
 
 let guard p err = if p then Ok () else err
 
-let location headers =
-  match Cohttp.Header.get_location headers with
-  | Some url -> Ok url
-  | None ->
-    Rresult.R.error_msgf "expected a location header, but couldn't fine any in %a"
-      Cohttp.Header.pp_hum headers
-
 let key_authorization key token =
   let pk = Primitives.pub_of_priv key in
   let thumbprint = Jwk.thumbprint (`Rsa pk) in
@@ -34,13 +27,8 @@ type solver = {
 
 let error_in endpoint status body =
   Rresult.R.error_msgf
-    "Error at %s: status %s - body: %S"
-    endpoint (Cohttp.Code.string_of_status status) body
-
-let extract_nonce headers =
-  match Cohttp.Header.get headers "Replay-Nonce" with
-  | Some nonce -> Ok nonce
-  | None -> Error (`Msg "Error: I could not fetch a new nonce.")
+    "Error at %s: status %3d - body: %S"
+    endpoint status body
 
 let http_solver writef =
   let solve_challenge ~token ~key_authorization domain =
@@ -162,39 +150,50 @@ let print_alpn =
   in
   alpn_solver solve
 
-module Make (Http : Cohttp_lwt.S.Client) = struct
+module Make (Http : HTTP_client.S) = struct
+
+let location headers =
+  match Http.Headers.get_location headers with
+  | Some url -> Ok url
+  | None ->
+    Rresult.R.error_msgf "expected a location header, but couldn't find it"
+
+let extract_nonce headers =
+  match Http.Headers.get headers "Replay-Nonce" with
+  | Some nonce -> Ok nonce
+  | None -> Error (`Msg "Error: I could not fetch a new nonce.")
 
 let headers =
-  Cohttp.Header.init_with "user-agent" ("ocaml-letsencrypt/" ^ Version.t)
+  Http.Headers.init_with "user-agent" ("ocaml-letsencrypt/" ^ Version.t)
 
 let http_get ?ctx url =
   Http.get ?ctx ~headers url >>= fun (resp, body) ->
-  let status = Cohttp.Response.status resp in
-  let headers = Cohttp.Response.headers resp in
-  body |> Cohttp_lwt.Body.to_string >>= fun body ->
+  let status = Http.Response.status resp in
+  let headers = Http.Response.headers resp in
+  body |> Http.Body.to_string >>= fun body ->
   Log.debug (fun m -> m "HTTP get: %a" Uri.pp_hum url);
-  Log.debug (fun m -> m "Got status: %s" (Cohttp.Code.string_of_status status));
-  Log.debug (fun m -> m "headers %S" (Cohttp.Header.to_string headers));
+  Log.debug (fun m -> m "Got status: %3d" status);
+  Log.debug (fun m -> m "headers %S" (Http.Headers.to_string headers));
   Log.debug (fun m -> m "body %S" body);
   Lwt.return (status, headers, body)
 
 let http_head ?ctx url =
   Http.head ?ctx ~headers url >>= fun resp ->
-  let status = Cohttp.Response.status resp in
-  let headers = Cohttp.Response.headers resp in
+  let status = Http.Response.status resp in
+  let headers = Http.Response.headers resp in
   Log.debug (fun m -> m "HTTP HEAD: %a" Uri.pp_hum url);
-  Log.debug (fun m -> m "Got status: %s" (Cohttp.Code.string_of_status status));
-  Log.debug (fun m -> m "headers %S" (Cohttp.Header.to_string headers));
+  Log.debug (fun m -> m "Got status: %3d" status);
+  Log.debug (fun m -> m "headers %S" (Http.Headers.to_string headers));
   Lwt.return (status, headers)
 
 let discover ?ctx directory =
   http_get ?ctx directory >|= function
-  | (`OK, _headers, body) -> Directory.decode body
+  | (200, _headers, body) -> Directory.decode body
   | (status, _, body) -> error_in "discover" status body
 
 let get_nonce ?ctx url =
   http_head ?ctx url >|= function
-  | `OK, headers -> extract_nonce headers
+  | 200, headers -> extract_nonce headers
   | s, _ -> error_in "get_nonce" s ""
 
 let rec http_post_jws ?ctx ?(no_key_url = false) cli data url =
@@ -202,25 +201,25 @@ let rec http_post_jws ?ctx ?(no_key_url = false) cli data url =
     let kid_url = if no_key_url then None else Some cli.account_url in
     let body = Jws.encode_acme ?kid_url ~data:(json_to_string data) ~nonce url key in
     let body_len = string_of_int (String.length body) in
-    let headers = Cohttp.Header.add headers  "Content-Length" body_len in
-    let headers = Cohttp.Header.add headers "Content-Type" "application/jose+json" in
+    let headers = Http.Headers.add headers  "Content-Length" body_len in
+    let headers = Http.Headers.add headers "Content-Type" "application/jose+json" in
     (headers, body)
   in
   let headers, body = prepare_post cli.account_key cli.next_nonce in
   Log.debug (fun m -> m "HTTP post %a (data %s body %S)"
                 Uri.pp_hum url (json_to_string data) body);
-  let body = Cohttp_lwt.Body.of_string body in
+  let body = Http.Body.of_string body in
   Http.post ?ctx ~body ~headers url >>= fun (resp, body) ->
-  let status = Cohttp.Response.status resp in
-  let headers = Cohttp.Response.headers resp in
-  Cohttp_lwt.Body.to_string body >>= fun body ->
-  Log.debug (fun m -> m "Got code: %s" (Cohttp.Code.string_of_status status));
-  Log.debug (fun m -> m "headers %S" (Cohttp.Header.to_string headers));
+  let status = Http.Response.status resp in
+  let headers = Http.Response.headers resp in
+  Http.Body.to_string body >>= fun body ->
+  Log.debug (fun m -> m "Got code: %3d" status);
+  Log.debug (fun m -> m "headers %S" (Http.Headers.to_string headers));
   Log.debug (fun m -> m "body %S" body);
   (match extract_nonce headers with
    | Error `Msg e -> Log.err (fun m -> m "couldn't extract nonce: %s" e)
    | Ok next_nonce -> cli.next_nonce <- next_nonce);
-  if status = `Bad_request then begin
+  if status = 400 then begin
     let open Lwt_result.Infix in
     Lwt_result.lift (Error.decode body) >>= fun err ->
     if err.err_typ = `Bad_nonce then begin
@@ -243,7 +242,7 @@ let create_account ?ctx ?email cli =
   let body = `Assoc (("termsOfServiceAgreed", `Bool true) :: contact) in
   http_post_jws ?ctx ~no_key_url:true cli body url >|= function
   | Error e -> Error e
-  | Ok (`Created, headers, body) ->
+  | Ok (201, headers, body) ->
     let open Rresult.R.Infix in
     Account.decode body >>= fun account ->
     guard (account.account_status = `Valid)
@@ -257,7 +256,7 @@ let get_account ?ctx cli url =
   let body = `Null in
   http_post_jws ?ctx cli body url >|= function
   | Error e -> Error e
-  | Ok (`OK, _headers, body) ->
+  | Ok (200, _headers, body) ->
     let open Rresult.R.Infix in
     (* at least staging doesn't include orders *)
     Account.decode body >>| fun acc ->
@@ -277,7 +276,7 @@ let find_account_url ?ctx ?email ~nonce key directory =
   } in
   http_post_jws ?ctx ~no_key_url:true cli body url >>= function
   | Error e -> Lwt.return (Error e)
-  | Ok (`OK, headers, body) ->
+  | Ok (200, headers, body) ->
     let open Rresult.R.Infix in
     Lwt.return begin
       (* unclear why this is not an account object, as required in 7.3.0/7.3.1 *)
@@ -288,7 +287,7 @@ let find_account_url ?ctx ?email ~nonce key directory =
       location headers >>| fun account_url ->
       { cli with account_url }
     end
-  | Ok (`Bad_request, _headers, body) ->
+  | Ok (400, _headers, body) ->
     let open Lwt_result.Infix in
     Lwt_result.lift (Error.decode body) >>= fun err ->
     if err.err_typ = `Account_does_not_exist then begin
@@ -296,7 +295,7 @@ let find_account_url ?ctx ?email ~nonce key directory =
       create_account ?ctx ?email cli
     end else begin
       Log.err (fun m -> m "error %a in find account url" Error.pp err);
-      Lwt.return (error_in "newAccount" `Bad_request body)
+      Lwt.return (error_in "newAccount" 400 body)
     end
   (* according to RFC 8555 7.3.3 there can be a forbidden if ToS were updated,
      and the client should re-approve them *)
@@ -307,10 +306,10 @@ let challenge_solved ?ctx cli url =
   let body = `Assoc [] in (* not entirely clear why this now is {} and not "" *)
   http_post_jws ?ctx cli body url >|= function
   | Error e -> Error e
-  | Ok (`OK, _headers, body) ->
+  | Ok (200, _headers, body) ->
     Log.info (fun m -> m "challenge solved POSTed (OK), body %s" body);
     Ok ()
-  | Ok (`Created, _headers, body) ->
+  | Ok (201, _headers, body) ->
     Log.info (fun m -> m "challenge solved POSTed (CREATE), body %s" body);
     Ok ()
   | Ok (status, _headers, body) ->
@@ -371,7 +370,7 @@ let process_authorization ?ctx solver cli sleep url =
   let body = `Null in
   http_post_jws ?ctx cli body url >>= function
   | Error e -> Lwt.return (Error e)
-  | Ok (`OK, _headers, body) ->
+  | Ok (200, _headers, body) ->
     begin
       let open Lwt_result.Infix in
       Lwt_result.lift (Authorization.decode body) >>= fun auth ->
@@ -416,7 +415,7 @@ let finalize ?ctx cli csr url =
   in
   http_post_jws ?ctx cli body url >|= function
   | Error e -> Error e
-  | Ok (`OK, headers, body) ->
+  | Ok (200, headers, body) ->
     let open Rresult.R.Infix in
     Order.decode body >>| fun order ->
     headers, order
@@ -426,7 +425,7 @@ let dl_certificate ?ctx cli url =
   let body = `Null in
   http_post_jws ?ctx cli body url >|= function
   | Error e -> Error e
-  | Ok (`OK, _headers, body) ->
+  | Ok (200, _headers, body) ->
     (* body is a certificate chain (no comments), with end-entity certificate being the first *)
     (* TODO: check order? figure out chain? *)
     X509.Certificate.decode_pem_multiple (Cstruct.of_string body)
@@ -436,7 +435,7 @@ let get_order ?ctx cli url =
   let body = `Null in
   http_post_jws ?ctx cli body url >|= function
   | Error e -> Error e
-  | Ok (`OK, headers, body) ->
+  | Ok (200, headers, body) ->
     let open Rresult.R.Infix in
     Order.decode body >>| fun order ->
     headers, order
@@ -445,7 +444,7 @@ let get_order ?ctx cli url =
 
 (* HTTP defines this header as "either seconds" or "absolute HTTP date" *)
 let retry_after h =
-  match Cohttp.Header.get h "Retry-after" with
+  match Http.Headers.get h "Retry-after" with
   | None -> 1
   | Some x -> try int_of_string x with
       Failure _ ->
@@ -543,7 +542,7 @@ let new_order ?ctx solver cli sleep csr =
   in
   http_post_jws ?ctx cli body cli.d.new_order >>= function
   | Error e -> Lwt.return (Error e)
-  | Ok (`Created, headers, body) ->
+  | Ok (201, headers, body) ->
     let open Lwt_result.Infix in
     Lwt_result.lift (Order.decode body) >>= fun order ->
     (* identifiers (should-be-verified to be the same set as the hostnames above?) *)
